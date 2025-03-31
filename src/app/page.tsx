@@ -1,40 +1,28 @@
 "use client";
 
 import { useState, useEffect } from 'react';
-import { Server } from '@/lib/api/types';
+import { fetchServersFromSupabase, saveServersToSupabase } from '@/lib/api/supabaseClient';
 import { fetchServers } from '@/lib/api/apiClient';
 import { loadApiSettings } from '@/lib/api/settingsStorage';
-import Link from 'next/link';
+import DashboardLayout from '@/components/DashboardLayout';
 import { formatBytes, formatDate, formatCurrency, getStatusColor } from '@/lib/utils';
+import Link from 'next/link';
 
 export default function Dashboard() {
-  const [servers, setServers] = useState<Server[]>([]);
-  const [filteredServers, setFilteredServers] = useState<Server[]>([]);
-  const [projectName, setProjectName] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [copiedIp, setCopiedIp] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [sortField, setSortField] = useState<string>('name');
-  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
-  const [currencyDisplay, setCurrencyDisplay] = useState<'EUR' | 'INR'>('EUR');
-  const [isMobile, setIsMobile] = useState<boolean>(false);
-
-  useEffect(() => {
-    // Check if viewport is mobile
-    const checkMobile = () => {
-      setIsMobile(window.innerWidth < 768);
-    };
-    
-    // Initial check
-    checkMobile();
-    
-    // Add event listener for window resize
-    window.addEventListener('resize', checkMobile);
-    
-    // Cleanup
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
+  const [servers, setServers] = useState([]);
+  const [filteredServers, setFilteredServers] = useState([]);
+  const [projectName, setProjectName] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [copiedIp, setCopiedIp] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sortField, setSortField] = useState('name');
+  const [sortDirection, setSortDirection] = useState('asc');
+  const [currencyDisplay, setCurrencyDisplay] = useState('EUR');
+  const [selectedRows, setSelectedRows] = useState([]);
+  const [allSelected, setAllSelected] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(10);
 
   useEffect(() => {
     const loadServers = async () => {
@@ -42,20 +30,43 @@ export default function Dashboard() {
       setError(null);
       
       try {
-        const settings = loadApiSettings();
-        
-        if (!settings) {
-          setError('API settings not configured. Please go to Settings page.');
-          setLoading(false);
-          return;
+        // First try to load from Supabase
+        let supabaseServers = [];
+        try {
+          supabaseServers = await fetchServersFromSupabase();
+          if (supabaseServers && supabaseServers.length > 0) {
+            setServers(supabaseServers);
+            setFilteredServers(supabaseServers);
+            setLoading(false);
+          }
+        } catch (supabaseError) {
+          console.error('Error loading from Supabase, falling back to API:', supabaseError);
         }
         
-        setProjectName(settings.projectName);
-        
-        const data = await fetchServers(settings.apiToken, settings.projectName);
-        setServers(data.servers);
-        setFilteredServers(data.servers);
-      } catch (error: any) {
+        // If no data in Supabase or error occurred, fetch from Hetzner API
+        if (supabaseServers.length === 0) {
+          const settings = loadApiSettings();
+          
+          if (!settings) {
+            setError('API settings not configured. Please go to Settings page.');
+            setLoading(false);
+            return;
+          }
+          
+          setProjectName(settings.projectName);
+          
+          const data = await fetchServers(settings.apiToken, settings.projectName);
+          setServers(data.servers);
+          setFilteredServers(data.servers);
+          
+          // Save to Supabase
+          try {
+            await saveServersToSupabase(data.servers);
+          } catch (saveError) {
+            console.error('Error saving to Supabase:', saveError);
+          }
+        }
+      } catch (error) {
         console.error('Error loading servers:', error);
         setError(error.message || 'Failed to load server data');
       } finally {
@@ -80,6 +91,7 @@ export default function Dashboard() {
       );
       setFilteredServers(filtered);
     }
+    setCurrentPage(1); // Reset to first page when filtering
   }, [searchQuery, servers]);
 
   useEffect(() => {
@@ -131,13 +143,13 @@ export default function Dashboard() {
     setFilteredServers(sorted);
   }, [sortField, sortDirection]);
   
-  const handleCopyIp = (ip: string) => {
+  const handleCopyIp = (ip) => {
     navigator.clipboard.writeText(ip);
     setCopiedIp(ip);
     setTimeout(() => setCopiedIp(null), 2000);
   };
 
-  const handleSort = (field: string) => {
+  const handleSort = (field) => {
     if (field === sortField) {
       setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
     } else {
@@ -149,399 +161,439 @@ export default function Dashboard() {
   const toggleCurrency = () => {
     setCurrencyDisplay(currencyDisplay === 'EUR' ? 'INR' : 'EUR');
   };
+  
+  const handleSelectAll = () => {
+    if (allSelected) {
+      setSelectedRows([]);
+    } else {
+      setSelectedRows(paginatedServers.map(server => server.id));
+    }
+    setAllSelected(!allSelected);
+  };
+  
+  const handleSelectRow = (id) => {
+    if (selectedRows.includes(id)) {
+      setSelectedRows(selectedRows.filter(rowId => rowId !== id));
+    } else {
+      setSelectedRows([...selectedRows, id]);
+    }
+  };
+  
+  // Pagination
+  const indexOfLastItem = currentPage * itemsPerPage;
+  const indexOfFirstItem = indexOfLastItem - itemsPerPage;
+  const paginatedServers = filteredServers.slice(indexOfFirstItem, indexOfLastItem);
+  const totalPages = Math.ceil(filteredServers.length / itemsPerPage);
+  
+  const paginate = (pageNumber) => {
+    if (pageNumber > 0 && pageNumber <= totalPages) {
+      setCurrentPage(pageNumber);
+    }
+  };
+  
+  const refreshData = async () => {
+    setLoading(true);
+    try {
+      const settings = loadApiSettings();
+      
+      if (!settings) {
+        setError('API settings not configured. Please go to Settings page.');
+        setLoading(false);
+        return;
+      }
+      
+      const data = await fetchServers(settings.apiToken, settings.projectName);
+      setServers(data.servers);
+      setFilteredServers(data.servers);
+      
+      // Save to Supabase
+      try {
+        await saveServersToSupabase(data.servers);
+      } catch (saveError) {
+        console.error('Error saving to Supabase:', saveError);
+      }
+    } catch (error) {
+      console.error('Error refreshing data:', error);
+      setError(error.message || 'Failed to refresh data');
+    } finally {
+      setLoading(false);
+    }
+  };
 
-  // Mobile card view for each server
-  const renderMobileCard = (server: Server) => {
-    // Get the price in EUR and INR
-    const priceMonthly = server.server_type.prices?.[0]?.price_monthly;
-    const priceEur = priceMonthly ? priceMonthly.gross : 'N/A';
-    const priceInr = priceMonthly?.inr || 'N/A';
-    
-    return (
-      <div key={server.id} className="card-view bg-white dark:bg-gray-800 shadow mb-4 rounded-lg overflow-hidden">
-        <div className="card-header">
-          <div className="flex justify-between items-center">
-            <div className="text-lg font-medium text-gray-900 dark:text-white">{server.name}</div>
-            <div className={`text-xs ${getStatusColor(server.status)}`}>
-              <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
-                {server.status}
-              </span>
-            </div>
-          </div>
-        </div>
-        <div className="card-body">
-          <div className="card-row">
-            <div className="card-label">Created</div>
-            <div className="card-value">{formatDate(server.created)}</div>
-          </div>
-          <div className="card-row">
-            <div className="card-label">Instance ID</div>
-            <div className="card-value">{server.id}</div>
-          </div>
-          <div className="card-row">
-            <div className="card-label">IPv4</div>
-            <div className="card-value flex items-center justify-end">
-              <span className="mr-2">{server.public_net.ipv4?.ip || 'N/A'}</span>
-              {server.public_net.ipv4?.ip && (
+  return (
+    <DashboardLayout activePage="dashboard">
+      <div className="filter-section">
+        <div className="flex flex-col md:flex-row justify-between w-full gap-4">
+          <div className="flex-1">
+            <div className="search-bar">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              <input
+                type="text"
+                placeholder="What are you looking for?"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              {searchQuery && (
                 <button
-                  onClick={() => handleCopyIp(server.public_net.ipv4.ip)}
-                  className="inline-flex items-center p-1 border border-transparent rounded-full shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-offset-gray-800"
-                  title="Copy IP address"
+                  onClick={() => setSearchQuery('')}
+                  className="ml-2 text-gray-400 hover:text-gray-500"
                 >
-                  {copiedIp === server.public_net.ipv4.ip ? (
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                      <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                    </svg>
-                  ) : (
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                      <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z" />
-                      <path d="M3 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v6h-4.586l1.293-1.293a1 1 0 00-1.414-1.414l-3 3a1 1 0 000 1.414l3 3a1 1 0 001.414-1.414L10.414 13H15v3a2 2 0 01-2 2H5a2 2 0 01-2-2V5zM15 11h2a1 1 0 110 2h-2v-2z" />
-                    </svg>
-                  )}
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                  </svg>
                 </button>
               )}
             </div>
           </div>
-          <div className="card-row">
-            <div className="card-label">Hardware</div>
-            <div className="card-value">
-              <div>{server.server_type.cores} Cores</div>
-              <div>{server.server_type.memory} GB RAM</div>
-              <div>{server.server_type.disk} GB Disk</div>
+          
+          <div className="flex flex-col md:flex-row gap-4">
+            <div className="filter-group">
+              <label className="filter-label">Status</label>
+              <select className="filter-select">
+                <option value="all">All</option>
+                <option value="running">Running</option>
+                <option value="stopped">Stopped</option>
+              </select>
             </div>
-          </div>
-          <div className="card-row">
-            <div className="card-label">Traffic</div>
-            <div className="card-value">
-              <div>In: {formatBytes(server.ingoing_traffic || 0)}</div>
-              <div>Out: {formatBytes(server.outgoing_traffic || 0)}</div>
+            
+            <div className="filter-group">
+              <label className="filter-label">Currency</label>
+              <select 
+                className="filter-select"
+                value={currencyDisplay}
+                onChange={(e) => setCurrencyDisplay(e.target.value)}
+              >
+                <option value="EUR">EUR</option>
+                <option value="INR">INR</option>
+              </select>
             </div>
-          </div>
-          <div className="card-row">
-            <div className="card-label">OS</div>
-            <div className="card-value">
-              {server.image?.os_flavor || 'N/A'} {server.image?.os_version || ''}
-            </div>
-          </div>
-          <div className="card-row">
-            <div className="card-label">Price</div>
-            <div className="card-value">
-              {currencyDisplay === 'EUR' 
-                ? formatCurrency(priceEur, 'EUR')
-                : formatCurrency(priceInr, 'INR')
-              }
-            </div>
+            
+            <button 
+              className="btn btn-primary self-end"
+              onClick={refreshData}
+            >
+              {loading ? (
+                <span className="flex items-center">
+                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Loading...
+                </span>
+              ) : 'Search'}
+            </button>
           </div>
         </div>
       </div>
-    );
-  };
-
-  return (
-    <div className="py-6">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 md:px-8">
-        <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">
-          {projectName ? `${projectName} Dashboard` : 'Hetzner Cloud Dashboard'}
-        </h1>
-      </div>
       
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 md:px-8 mt-6">
-        {loading ? (
-          <div className="bg-white dark:bg-gray-800 shadow overflow-hidden sm:rounded-lg">
-            <div className="flex justify-center items-center py-8">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500 dark:border-indigo-400"></div>
-            </div>
-          </div>
-        ) : error ? (
-          <div className="bg-red-50 dark:bg-red-900 shadow overflow-hidden sm:rounded-lg">
-            <div className="px-4 py-5 sm:p-6">
-              <div className="text-red-700 dark:text-red-200">
-                <p>{error}</p>
-                {error.includes('settings') && (
-                  <Link href="/settings" className="mt-4 inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-offset-gray-800">
-                    Go to Settings
-                  </Link>
-                )}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div>
-            <div className="mb-6 flex flex-col sm:flex-row justify-between items-start sm:items-center space-y-4 sm:space-y-0">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center space-y-2 sm:space-y-0 sm:space-x-4 w-full sm:w-auto">
-                <h2 className="text-lg font-medium text-gray-900 dark:text-white">
-                  Servers ({filteredServers.length})
-                </h2>
-                <div className="relative w-full sm:w-auto">
-                  <input
-                    type="text"
-                    placeholder="Search servers..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-md"
-                  />
-                  {searchQuery && (
-                    <button
-                      onClick={() => setSearchQuery('')}
-                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-500 dark:hover:text-gray-300"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-                      </svg>
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={toggleCurrency}
-                  className="inline-flex items-center px-3 py-2 border border-gray-300 dark:border-gray-600 shadow-sm text-sm leading-4 font-medium rounded-md text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-offset-gray-800"
-                >
-                  {currencyDisplay === 'EUR' ? 'Show INR' : 'Show EUR'}
-                </button>
-                <button
-                  onClick={() => window.location.reload()}
-                  className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-offset-gray-800"
-                >
-                  Refresh
-                </button>
-              </div>
-            </div>
-            
-            {filteredServers.length === 0 ? (
-              <div className="bg-white dark:bg-gray-800 shadow overflow-hidden sm:rounded-lg">
-                <div className="text-center py-8">
-                  <h3 className="text-lg font-medium text-gray-900 dark:text-white">No servers found</h3>
-                  <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-                    {searchQuery ? 'No servers match your search criteria.' : 'No servers were found in your Hetzner Cloud account.'}
-                  </p>
-                </div>
-              </div>
-            ) : isMobile ? (
-              // Mobile card view
-              <div className="space-y-4">
-                {filteredServers.map(server => renderMobileCard(server))}
-              </div>
-            ) : (
-              // Desktop modern table view
-              <div className="bg-white dark:bg-gray-800 shadow rounded-lg overflow-hidden">
-                <div className="responsive-table">
-                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-                    <thead>
-                      <tr className="bg-gray-50 dark:bg-gray-700">
-                        <th 
-                          scope="col" 
-                          className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer transition-colors hover:bg-gray-100 dark:hover:bg-gray-600"
-                          onClick={() => handleSort('name')}
-                        >
-                          <div className="flex items-center">
-                            <span>Hostname</span>
-                            {sortField === 'name' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
-                                  </svg>
-                                ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-                                  </svg>
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </th>
-                        <th 
-                          scope="col" 
-                          className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer transition-colors hover:bg-gray-100 dark:hover:bg-gray-600"
-                          onClick={() => handleSort('created')}
-                        >
-                          <div className="flex items-center">
-                            <span>Created</span>
-                            {sortField === 'created' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
-                                  </svg>
-                                ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-                                  </svg>
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </th>
-                        <th 
-                          scope="col" 
-                          className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer transition-colors hover:bg-gray-100 dark:hover:bg-gray-600"
-                          onClick={() => handleSort('id')}
-                        >
-                          <div className="flex items-center">
-                            <span>ID</span>
-                            {sortField === 'id' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
-                                  </svg>
-                                ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-                                  </svg>
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </th>
-                        <th scope="col" className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                          IPv4
-                        </th>
-                        <th 
-                          scope="col" 
-                          className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer transition-colors hover:bg-gray-100 dark:hover:bg-gray-600"
-                          onClick={() => handleSort('cores')}
-                        >
-                          <div className="flex items-center">
-                            <span>Hardware</span>
-                            {(sortField === 'cores' || sortField === 'memory' || sortField === 'disk') && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
-                                  </svg>
-                                ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-                                  </svg>
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </th>
-                        <th scope="col" className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                          Traffic
-                        </th>
-                        <th scope="col" className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                          OS
-                        </th>
-                        <th 
-                          scope="col" 
-                          className="px-6 py-4 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer transition-colors hover:bg-gray-100 dark:hover:bg-gray-600"
-                          onClick={() => handleSort('price')}
-                        >
-                          <div className="flex items-center">
-                            <span>Price</span>
-                            {sortField === 'price' && (
-                              <span className="ml-1">
-                                {sortDirection === 'asc' ? (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
-                                  </svg>
-                                ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-                                  </svg>
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredServers.map((server, idx) => {
-                        // Get the price in EUR and INR
-                        const priceMonthly = server.server_type.prices?.[0]?.price_monthly;
-                        const priceEur = priceMonthly ? priceMonthly.gross : 'N/A';
-                        const priceInr = priceMonthly?.inr || 'N/A';
-                        
-                        return (
-                          <tr 
-                            key={server.id} 
-                            className={`${idx % 2 === 0 ? 'bg-white dark:bg-gray-800' : 'bg-gray-50 dark:bg-gray-700'} hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-colors duration-150`}
-                          >
-                            <td className="px-6 py-4">
-                              <div className="flex items-center">
-                                <div>
-                                  <div className="text-sm font-medium text-gray-900 dark:text-white">{server.name}</div>
-                                  <div className={`text-xs ${getStatusColor(server.status)}`}>
-                                    <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
-                                      {server.status}
-                                    </span>
-                                  </div>
-                                </div>
-                              </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm text-gray-900 dark:text-white">{formatDate(server.created)}</div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm text-gray-900 dark:text-white">{server.id}</div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="flex items-center">
-                                <span className="text-sm text-gray-900 dark:text-white mr-2">{server.public_net.ipv4?.ip || 'N/A'}</span>
-                                {server.public_net.ipv4?.ip && (
-                                  <button
-                                    onClick={() => handleCopyIp(server.public_net.ipv4.ip)}
-                                    className="inline-flex items-center p-1 border border-transparent rounded-full shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-offset-gray-800"
-                                    title="Copy IP address"
-                                  >
-                                    {copiedIp === server.public_net.ipv4.ip ? (
-                                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                        <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                                      </svg>
-                                    ) : (
-                                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                        <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z" />
-                                        <path d="M3 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v6h-4.586l1.293-1.293a1 1 0 00-1.414-1.414l-3 3a1 1 0 000 1.414l3 3a1 1 0 001.414-1.414L10.414 13H15v3a2 2 0 01-2 2H5a2 2 0 01-2-2V5zM15 11h2a1 1 0 110 2h-2v-2z" />
-                                      </svg>
-                                    )}
-                                  </button>
-                                )}
-                              </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm text-gray-900 dark:text-white">
-                                <div className="flex flex-col">
-                                  <span className="font-medium">{server.server_type.cores} Cores</span>
-                                  <span>{server.server_type.memory} GB RAM</span>
-                                  <span>{server.server_type.disk} GB Disk</span>
-                                </div>
-                              </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm text-gray-900 dark:text-white">
-                                <div>In: {formatBytes(server.ingoing_traffic || 0)}</div>
-                                <div>Out: {formatBytes(server.outgoing_traffic || 0)}</div>
-                              </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm text-gray-900 dark:text-white">
-                                {server.image?.os_flavor || 'N/A'} {server.image?.os_version || ''}
-                              </div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <div className="text-sm font-medium text-gray-900 dark:text-white">
-                                {currencyDisplay === 'EUR' 
-                                  ? formatCurrency(priceEur, 'EUR')
-                                  : formatCurrency(priceInr, 'INR')
-                                }
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+      {loading ? (
+        <div className="card p-8 flex justify-center items-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-color"></div>
+        </div>
+      ) : error ? (
+        <div className="card p-6 bg-red-50">
+          <div className="text-red-700">
+            <p>{error}</p>
+            {error.includes('settings') && (
+              <Link href="/settings" className="mt-4 btn btn-primary">
+                Go to Settings
+              </Link>
             )}
           </div>
-        )}
-      </div>
-    </div>
+        </div>
+      ) : (
+        <div>
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-lg font-medium">Server Summary</h2>
+            <div className="flex items-center gap-2">
+              {selectedRows.length > 0 && (
+                <button className="btn btn-primary">
+                  Dispatch Selected ({selectedRows.length})
+                </button>
+              )}
+              <div className="flex items-center border border-gray-300 rounded-md overflow-hidden">
+                <button className="px-3 py-1 bg-white hover:bg-gray-50 border-r border-gray-300">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-500" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M3 5a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 15a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clipRule="evenodd" />
+                  </svg>
+                </button>
+                <button className="px-3 py-1 bg-white hover:bg-gray-50">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-500" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M5 3a2 2 0 00-2 2v2a2 2 0 002 2h2a2 2 0 002-2V5a2 2 0 00-2-2H5zM5 11a2 2 0 00-2 2v2a2 2 0 002 2h2a2 2 0 002-2v-2a2 2 0 00-2-2H5zM11 5a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V5zM11 13a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+          
+          {filteredServers.length === 0 ? (
+            <div className="card p-8 text-center">
+              <h3 className="text-lg font-medium text-gray-900">No servers found</h3>
+              <p className="mt-2 text-sm text-gray-500">
+                {searchQuery ? 'No servers match your search criteria.' : 'No servers were found in your Hetzner Cloud account.'}
+              </p>
+            </div>
+          ) : (
+            <div className="card">
+              <div className="table-container">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th className="checkbox-cell">
+                        <input 
+                          type="checkbox" 
+                          checked={allSelected}
+                          onChange={handleSelectAll}
+                          className="rounded border-gray-300 text-primary-color focus:ring-primary-color"
+                        />
+                      </th>
+                      <th 
+                        className="cursor-pointer"
+                        onClick={() => handleSort('id')}
+                      >
+                        <div className="flex items-center">
+                          <span>ID</span>
+                          {sortField === 'id' && (
+                            <span className="ml-1">
+                              {sortDirection === 'asc' ? (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                                </svg>
+                              ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                      <th 
+                        className="cursor-pointer"
+                        onClick={() => handleSort('name')}
+                      >
+                        <div className="flex items-center">
+                          <span>Server Name</span>
+                          {sortField === 'name' && (
+                            <span className="ml-1">
+                              {sortDirection === 'asc' ? (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                                </svg>
+                              ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                      <th 
+                        className="cursor-pointer"
+                        onClick={() => handleSort('created')}
+                      >
+                        <div className="flex items-center">
+                          <span>Date</span>
+                          {sortField === 'created' && (
+                            <span className="ml-1">
+                              {sortDirection === 'asc' ? (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                                </svg>
+                              ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                      <th>Status</th>
+                      <th>IPv4</th>
+                      <th 
+                        className="cursor-pointer"
+                        onClick={() => handleSort('cores')}
+                      >
+                        <div className="flex items-center">
+                          <span>Hardware</span>
+                          {(sortField === 'cores' || sortField === 'memory' || sortField === 'disk') && (
+                            <span className="ml-1">
+                              {sortDirection === 'asc' ? (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                                </svg>
+                              ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                      <th>OS</th>
+                      <th 
+                        className="cursor-pointer"
+                        onClick={() => handleSort('price')}
+                      >
+                        <div className="flex items-center">
+                          <span>Price</span>
+                          {sortField === 'price' && (
+                            <span className="ml-1">
+                              {sortDirection === 'asc' ? (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                                </svg>
+                              ) : (
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paginatedServers.map((server, idx) => {
+                      // Get the price in EUR and INR
+                      const priceMonthly = server.server_type.prices?.[0]?.price_monthly;
+                      const priceEur = priceMonthly ? priceMonthly.gross : 'N/A';
+                      const priceInr = priceMonthly?.inr || 'N/A';
+                      
+                      return (
+                        <tr key={server.id}>
+                          <td className="checkbox-cell">
+                            <input 
+                              type="checkbox" 
+                              checked={selectedRows.includes(server.id)}
+                              onChange={() => handleSelectRow(server.id)}
+                              className="rounded border-gray-300 text-primary-color focus:ring-primary-color"
+                            />
+                          </td>
+                          <td>{server.id}</td>
+                          <td>
+                            <div className="font-medium text-gray-900">{server.name}</div>
+                          </td>
+                          <td>{formatDate(server.created)}</td>
+                          <td>
+                            <span className={`status-badge ${server.status === 'running' ? 'status-active' : 'status-pending'}`}>
+                              {server.status}
+                            </span>
+                          </td>
+                          <td>
+                            <div className="flex items-center">
+                              <span className="mr-2">{server.public_net.ipv4?.ip || 'N/A'}</span>
+                              {server.public_net.ipv4?.ip && (
+                                <button
+                                  onClick={() => handleCopyIp(server.public_net.ipv4.ip)}
+                                  className="text-primary-color hover:text-primary-hover"
+                                  title="Copy IP address"
+                                >
+                                  {copiedIp === server.public_net.ipv4.ip ? (
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                      <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                                    </svg>
+                                  ) : (
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                      <path d="M8 2a1 1 0 000 2h2a1 1 0 100-2H8z" />
+                                      <path d="M3 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v6h-4.586l1.293-1.293a1 1 0 00-1.414-1.414l-3 3a1 1 0 000 1.414l3 3a1 1 0 001.414-1.414L10.414 13H15v3a2 2 0 01-2 2H5a2 2 0 01-2-2V5zM15 11h2a1 1 0 110 2h-2v-2z" />
+                                    </svg>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                          <td>
+                            <div>
+                              <div>{server.server_type.cores} Cores</div>
+                              <div>{server.server_type.memory} GB RAM</div>
+                              <div>{server.server_type.disk} GB Disk</div>
+                            </div>
+                          </td>
+                          <td>
+                            {server.image?.os_flavor || 'N/A'} {server.image?.os_version || ''}
+                          </td>
+                          <td>
+                            {currencyDisplay === 'EUR' 
+                              ? formatCurrency(priceEur, 'EUR')
+                              : formatCurrency(priceInr, 'INR')
+                            }
+                          </td>
+                          <td>
+                            <button className="text-gray-400 hover:text-gray-500">
+                              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path d="M6 10a2 2 0 11-4 0 2 2 0 014 0zM12 10a2 2 0 11-4 0 2 2 0 014 0zM16 12a2 2 0 100-4 2 2 0 000 4z" />
+                              </svg>
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              
+              <div className="pagination">
+                <div className="pagination-info">
+                  Showing {indexOfFirstItem + 1} to {Math.min(indexOfLastItem, filteredServers.length)} of {filteredServers.length} entries
+                </div>
+                <div className="pagination-controls">
+                  <button 
+                    className="pagination-button"
+                    onClick={() => paginate(currentPage - 1)}
+                    disabled={currentPage === 1}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" />
+                    </svg>
+                  </button>
+                  
+                  {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                    // Show pages around current page
+                    let pageNum;
+                    if (totalPages <= 5) {
+                      pageNum = i + 1;
+                    } else if (currentPage <= 3) {
+                      pageNum = i + 1;
+                    } else if (currentPage >= totalPages - 2) {
+                      pageNum = totalPages - 4 + i;
+                    } else {
+                      pageNum = currentPage - 2 + i;
+                    }
+                    
+                    return (
+                      <button 
+                        key={pageNum}
+                        className={`pagination-button ${currentPage === pageNum ? 'active' : ''}`}
+                        onClick={() => paginate(pageNum)}
+                      >
+                        {pageNum}
+                      </button>
+                    );
+                  })}
+                  
+                  <button 
+                    className="pagination-button"
+                    onClick={() => paginate(currentPage + 1)}
+                    disabled={currentPage === totalPages}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clipRule="evenodd" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </DashboardLayout>
   );
 }
